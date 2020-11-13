@@ -1,0 +1,416 @@
+import os
+
+# To run locally:
+# snakemake --snakefile Snakefile_pastml --keep-going --cores 7  --config folder=.. --use-singularity --singularity-prefix ~/.singularity --singularity-args "--home ~"
+
+# To run on bioevo:
+# change shakemake activation below if you are not Anna ;)
+# source /local/gensoft2/exe/conda/3.19.0/conda/bin/activate snakemake && module load singularity/3.5.3
+# snakemake --snakefile Snakefile_pastml --keep-going --cores 1 --use-singularity --singularity-prefix $HOME/.singularity --singularity-args "-B /pasteur" --cluster "sbatch -c {threads} -o logs/{params.name}.log -e logs/{params.name}.log --mem {params.mem} -p bioevo --qos=bioevo -A bioevo -J {params.name} -C avx2" --jobs 300
+
+# To visualise the pipeline
+# snakemake --snakefile Snakefile_pastml --config folder=.. --dag | dot -Tsvg > pipeline_pastml.svg
+
+configfile: "config.yaml"
+localrules: all, arv_metadata
+ruleorder: combine_acrs > pastml_vis_highlow_prevalence > pastml_drm > pastml_col
+
+os.makedirs('logs', exist_ok=True)
+
+folder = config["folder"]
+data_dir = os.path.join(config["folder"], config['data_dir'])
+
+# prevalence > 3%
+DRMs = ['RT:V106M', 'RT:K103N', 'RT:M184V', 'RT:G190A', 'RT:K103S']
+N = 5
+
+rule all:
+    input:
+        table = os.path.join(data_dir, 'figures', 'table.xlsx'),
+        ltt = os.path.join(data_dir, 'figures', 'LTT.png'),
+        map_html = expand(os.path.join(data_dir, 'acr', '{type}_subraxmlng.lsd2_{rep}.highlow_prevalence.html'), \
+        rep=range(N), type=['compressed']),
+        map_html_full = expand(os.path.join(data_dir, 'acr', '{type}_raxmlng.lsd2.highlow_prevalence.html'), \
+        type=['compressed']),
+        full_tree_svg = os.path.join(data_dir, 'figures', 'raxmlng.lsd2.svg'),
+        subtree_svg = expand(os.path.join(data_dir, 'figures', 'subraxmlng.lsd2_{rep}.svg'), rep=range(N)),
+        stats = os.path.join(data_dir, 'acr', 'pastml', 'all', 'raxmlng.lsd2', 'combined_ancestral_states.stats')
+
+
+rule name:
+    '''
+    Names a tree.
+    '''
+    input:
+        tree = os.path.join(data_dir, '{tree}.nexus'),
+    output:
+        tree = os.path.join(data_dir, '{tree}.named.nwk'),
+    threads: 1
+    params:
+        mem = 500,
+        name='name',
+        qos = 'fast'
+    singularity: "docker://evolbioinfo/pastml:v1.9.30"
+    shell:
+        """
+        python3 py/name_tree.py --input_tree {input.tree} --output_tree {output.tree}
+        """
+
+rule arv_metadata:
+    '''
+    Extracts DRM drug metadata.
+    '''
+    output:
+        data = os.path.join(data_dir, 'arv_metadata_{drm}.tab'),
+    threads: 1
+    params:
+        mem = 500,
+        name='arv_metadata_{drm}',
+        qos = 'fast',
+    singularity: "docker://evolbioinfo/python-evol:v3.6"
+    shell:
+        """
+        python3 py/drm2arv.py --drms {wildcards.drm} --output {output.data}
+        """
+
+rule pastml_drm:
+    '''
+    Cuts a tree based on date of the first drug than could inflict the DRM of interest.
+    Then reconstructs ancestral states on the forest and combines them with all-sensitive reconstruction for the root subtree.
+    '''
+    input:
+        tree = os.path.join(data_dir, '{tree}.named.nwk'),
+        log = os.path.join(data_dir, '{tree}.rootdate'),
+        arv_data = os.path.join(data_dir, 'arv_metadata_{drm}.tab'),
+        data = os.path.join(data_dir, 'metadata.drms.tab'),
+    output:
+        data = os.path.join(data_dir, 'acr', 'pastml', '{drm,(RT|PR)[:][A-Z][0-9]+[A-Z]}', '{tree}', 'combined_ancestral_states.tab'),
+        map = os.path.join(data_dir, 'acr', 'compressed_{tree}.{drm,(RT|PR)[:][A-Z][0-9]+[A-Z]}.html'),
+        html = os.path.join(data_dir, 'acr', 'full_{tree}.{drm,(RT|PR)[:][A-Z][0-9]+[A-Z]}.html'),
+    threads: 1
+    params:
+        mem = 500,
+        name='pastml_{tree}.{drm}',
+        qos = 'fast',
+        wd = os.path.join(data_dir, 'acr', 'pastml', '{drm}', '{tree}'),
+    singularity: "docker://evolbioinfo/pastml:v1.9.30"
+    shell:
+        """
+        date=`head {input.log}`
+
+        forest="{input.tree}.forest_{wildcards.drm}.nwk"
+
+        python3 py/cut_by_date.py --input_tree {input.tree} --arv_tab {input.arv_data} \
+        --output_forest $forest --root_date $date --arv {wildcards.drm}
+
+        pastml --tree $forest --data {input.data} -v --work_dir "{params.wd}" --columns "{wildcards.drm}"
+
+        mv "{params.wd}/combined_ancestral_states.tab" "{params.wd}/combined_ancestral_states.forest.tab"
+
+        rm $forest
+
+        python3 py/drm_metadata.py --input_tree {input.tree} --input_tab {input.data} \
+        --input_acr "{params.wd}/combined_ancestral_states.forest.tab" \
+        --output_tab {output.data} --arv_tab {input.arv_data} --root_date $date --arv {wildcards.drm}
+
+        pastml --tree {input.tree} -v --work_dir "{params.wd}" --html_compressed "{output.map}" --html "{output.html}" \
+        --columns "{wildcards.drm}" --tip_size_threshold 15 --prediction_method COPY --data {output.data} --root_date $date
+        """
+
+rule subtree:
+    '''
+    Creates a subtree.
+    '''
+    input:
+        tree = os.path.join(data_dir, 'acr', 'pastml', 'highlow_prevalence', '{tree}', 'named.tree_{tree}.named.nwk'),
+    output:
+        tree = os.path.join(data_dir, 'sub{tree}_{i}.named.nwk'),
+    threads:
+        1
+    params:
+        mem = 2000,
+        name = 'sub{tree}_{i}',
+    singularity: "docker://evolbioinfo/pastml:v1.9.30"
+    shell:
+        """
+        python py/subsampling.py --tree {input.tree} --subtree {output.tree}
+        """
+
+
+rule pastml_col:
+    '''
+    ACR with PastML.
+    '''
+    input:
+        tree = os.path.join(data_dir, '{tree}.named.nwk'),
+        data = os.path.join(data_dir, 'metadata.tab'),
+    output:
+        data = os.path.join(data_dir, 'acr', 'pastml', '{col,[a-z_]+}', '{tree}', 'combined_ancestral_states.tab'),
+        pars = os.path.join(data_dir, 'acr', 'pastml', '{col}', '{tree}', 'params.character_{col}.method_MPPA.model_F81.tab'),
+        mps = os.path.join(data_dir, 'acr', 'pastml', '{col}', '{tree}', 'marginal_probabilities.character_{col}.model_F81.tab'),
+        tree = os.path.join(data_dir, 'acr', 'pastml', '{col}', '{tree}', 'named.tree_{tree}.named.nwk'),
+    threads: 2
+    singularity: "docker://evolbioinfo/pastml:v1.9.30"
+    params:
+        mem = 4000,
+        name = 'acr_{col}.{tree}',
+        wd = os.path.join(data_dir, 'acr', 'pastml', '{col}', '{tree}')
+    shell:
+        """
+        pastml --tree {input.tree} --data {input.data} --columns "{wildcards.col}" -v --work_dir "{params.wd}"\
+        --resolve_polytomies
+        """
+
+rule pastml_vis_highlow_prevalence:
+    '''
+    ACR with PastML.
+    '''
+    input:
+        tree = os.path.join(data_dir, 'acr', 'pastml', 'highlow_prevalence', '{tree}', 'named.tree_{tree}.named.nwk'),
+        colours = os.path.join(data_dir, 'colours.tab'),
+    output:
+        map = os.path.join(data_dir, 'acr', 'compressed_{tree}.highlow_prevalence.html'),
+        html = os.path.join(data_dir, 'acr', 'full_{tree}.highlow_prevalence.html'),
+    threads: 2
+    singularity: "docker://evolbioinfo/pastml:v1.9.30"
+    params:
+        mem = 4000,
+        name = 'acr_highlow_prevalence.{tree}',
+        wd = os.path.join(data_dir, 'acr', 'pastml', 'highlow_prevalence', 'vis_{tree}')
+    shell:
+        """
+        pastml --tree {input.tree} --columns "highlow_prevalence" -v --work_dir "{params.wd}" --prediction_method COPY \
+         --colours {input.colours}  --html_compressed "{output.map}"  --html "{output.html}" \
+         --timeline_type LTT --tip_size_threshold 17
+
+         rm -rf {params.wd}
+        """
+
+rule transmission_counts:
+    '''
+    Counts transmissions from the ACR.
+    '''
+    input:
+        trees = expand(os.path.join(data_dir, 'acr', 'pastml', 'highlow_prevalence', 'subraxmlng.lsd2_{i}', 'named.tree_subraxmlng.lsd2_{i}.named.nwk'), i=range(N)),
+        tree = os.path.join(data_dir, 'acr', 'pastml', 'highlow_prevalence', 'raxmlng.lsd2', 'named.tree_raxmlng.lsd2.named.nwk'),
+        mps = expand(os.path.join(data_dir, 'acr', 'pastml', 'highlow_prevalence', 'subraxmlng.lsd2_{i}', 'marginal_probabilities.character_highlow_prevalence.model_F81.tab'), i=range(N)),
+        mp = os.path.join(data_dir, 'acr', 'pastml', 'highlow_prevalence', 'raxmlng.lsd2', 'marginal_probabilities.character_highlow_prevalence.model_F81.tab'),
+    output:
+        table = os.path.join(data_dir, 'figures', 'table.xlsx')
+    threads: 1
+    params:
+        mem = 2000,
+        name = 'pastml_tables',
+        labels = ['raxmlng.lsd2'] + ['subraxmlng.lsd2_{}'.format(i) for i in range(N)],
+        html = os.path.join(data_dir, 'figures', 'transmissions_{}_{}-{}.html')
+    singularity: "docker://evolbioinfo/python-evol:v3.6richer.1"
+    shell:
+        """
+        python py/vis_transmissions.py --trees {input.tree} {input.trees} --table {output.table} \
+        --column highlow_prevalence --labels {params.labels} --mps {input.mp} {input.mps} \
+        --out_html {params.html}
+        """
+
+rule ltt_plots:
+    '''
+    Visualised LTT plots.
+    '''
+    input:
+        trees = expand(os.path.join(data_dir, 'acr', 'pastml', 'highlow_prevalence', 'subraxmlng.lsd2_{i}', 'named.tree_subraxmlng.lsd2_{i}.named.nwk'), i=range(N)),
+        tree = os.path.join(data_dir, 'acr', 'pastml', 'highlow_prevalence', 'raxmlng.lsd2', 'named.tree_raxmlng.lsd2.named.nwk')
+    output:
+        time_pdf = os.path.join(data_dir, 'figures', 'LTT.pdf'),
+        png = os.path.join(data_dir, 'figures', 'LTT.png'),
+    threads: 1
+    params:
+        mem = 2000,
+        name = 'LTT',
+        labels = ['raxmlng.lsd2'] + ['subraxmlng.lsd2_{}'.format(i) for i in range(N)],
+    singularity: "docker://evolbioinfo/python-evol:v3.6richer.1"
+    shell:
+        """
+        python py/vis_LTT.py --trees {input.tree} {input.trees} \
+        --time_pdf {output.time_pdf} --png {output.png}  --column highlow_prevalence --labels {params.labels}
+        """
+
+rule combine_acrs:
+    '''Combine all state predictions into one table'''
+    input:
+        tree = os.path.join(data_dir, '{tree}.named.nwk'),
+        log = os.path.join(data_dir, '{tree}.rootdate'),
+        data = expand(os.path.join(data_dir, 'acr', 'pastml', 'highlow_prevalence', 'sub{{tree}}_{i}', 'combined_ancestral_states.tab'), i=range(N)),
+        data_full = expand(os.path.join(data_dir, 'acr', 'pastml', '{col}', '{{tree}}', 'combined_ancestral_states.tab'), col=['highlow_prevalence', 'urbanrural'] + DRMs)
+    output:
+        data = os.path.join(data_dir, 'acr', 'pastml', 'all', '{tree}', 'combined_ancestral_states.tab'),
+    threads: 1
+    params:
+        mem = 500,
+        name='combine_acrs.{tree}',
+        qos = 'fast',
+        names = ['highlow_prevalence_{}'.format(i) for i in range(N)] + ['highlow_prevalence', 'urbanrural'] + DRMs
+    singularity: "docker://evolbioinfo/pastml:v1.9.20"
+    shell:
+        """
+        date=`head {input.log}`
+
+        python3 py/merge_tables.py --input_tabs {input.data} {input.data_full} --input_names {params.names}\
+        --output_tab {output.data} --tree {input.tree} --root_date $date
+        """
+
+rule acrs_stats:
+    '''Check state predictions for subsampled and full trees'''
+    input:
+        data = os.path.join(data_dir, 'acr', 'pastml', 'all', '{tree}', 'combined_ancestral_states.tab'),
+    output:
+        log = os.path.join(data_dir, 'acr', 'pastml', 'all', '{tree}', 'combined_ancestral_states.stats'),
+    threads: 1
+    params:
+        mem = 500,
+        name='combined_stats.{tree}',
+        qos = 'fast',
+    singularity: "docker://evolbioinfo/pastml:v1.9.20"
+    shell:
+        """
+        python3 py/check_subsampling.py --input_tab {input.data} --output_log {output.log} --column highlow_prevalence
+        """
+
+rule itol_upload:
+    '''
+    Upload PastML ACRs to iTOL.
+    '''
+    input:
+        tree = os.path.join(data_dir, '{tree}.named.nwk'),
+        log = os.path.join(data_dir, '{tree}.rootdate'),
+        data = os.path.join(data_dir, 'acr', 'pastml', 'all', '{tree}', 'combined_ancestral_states.tab'),
+        colours = os.path.join(data_dir, 'colours.tab'),
+    output:
+        tree_id = os.path.join(data_dir, 'acr', 'pastml', 'itol', '{tree}', 'iTOL_tree_id.txt'),
+    threads: 1
+    singularity: "docker://evolbioinfo/pastml:v1.9.20"
+    params:
+        mem = 4000,
+        name = 'itol_{tree}',
+        wd = os.path.join(data_dir, 'acr', 'pastml', 'itol', '{tree}'),
+        qos = 'fast'
+    shell:
+        """
+        date=`head {input.log}`
+
+        pastml --tree {input.tree} --data {input.data} -v --work_dir "{params.wd}" --root_date $date \
+        --prediction_method COPY --colours {input.colours} {input.colours} {input.colours} {input.colours} {input.colours} {input.colours}\
+        --upload_to_itol --itol_id ZxuhG2okfKLQnsgd5xAEGQ --itol_project africa \
+        --itol_tree_name "{wildcards.tree}" --threads {threads}
+        """
+
+
+rule itol_download:
+    '''
+    Extracts itol visualisations.
+    '''
+    input:
+        rd = os.path.join(data_dir, '{tree}.rootdate'),
+        tree_id = os.path.join(data_dir, 'acr', 'pastml', 'itol', '{tree}', 'iTOL_tree_id.txt'),
+    output:
+        loc = os.path.join(data_dir, 'figures', '{tree}.{format}')
+    params:
+        mem = 2000,
+        name = 'itol_config_{tree}',
+    singularity:
+        "docker://evolbioinfo/gotree:v0.3.0b"
+    threads: 1
+    shell:
+        """
+        tree=`head {input.tree_id}`
+        date=`head {input.rd}`
+        tipdate='2016'
+        fixed_dates=`awk -v n="$date" -v m="$tipdate" 'BEGIN {{ y=n + 1; while (y < m) {{printf("%.2f", int(y) - n); if (y + 1 < m) {{ printf(",") }}; y += 1;}}; }}'`
+        rm -rf {output.loc}.config.tab
+        echo "tree\t$tree" > {output.loc}.config.tab
+
+        echo '''format\t{wildcards.format}
+display_mode\t1
+vertical_shift_factor\t0.04
+normal_rotation\t90
+line_width\t2
+default_branch_color\trgb(170,170,170)
+line_gradient\t1
+current_font_size\t0
+internal_scale\t1
+internalScaleAxis\t0
+internalScaleGrid\t1
+internalScaleFontSize\t20
+internalScale1\t10
+internalScale2\t1
+internalScale1Color\trgb(222,222,222)
+internalScale2Color\trgb(222,222,222)
+internalScaleFixedColor\trgb(222,222,222)
+internalScale1Label\t0
+internalScale2Label\t0
+internalScaleTimeScaling\t1
+label_display\t0
+datasets_visible\t11,2,4,3,0,6,7,8,9,10,17
+range_mode\t0
+include_ranges_legend\t0
+tree_x\t750''' >> {output.loc}.config.tab
+        echo "internalScaleRootValue\t${{date}}" >> {output.loc}.config.tab
+        echo "internalScaleFixed\t\\\"${{fixed_dates}}\\\"" >> {output.loc}.config.tab
+
+        gotree download itol -i $tree -c {output.loc}.config.tab -o {output.loc} --format {wildcards.format}
+        """
+
+rule itol_download_subsampled_tree:
+    '''
+    Extracts itol visualisations.
+    '''
+    input:
+        rd = os.path.join(data_dir, '{tree}.rootdate'),
+        tree_id = os.path.join(data_dir, 'acr', 'pastml', 'itol', '{tree}', 'iTOL_tree_id.txt'),
+    output:
+        loc = os.path.join(data_dir, 'figures', 'sub{tree}_{i}.{format}')
+    params:
+        mem = 2000,
+        name = 'itol_config_{tree}',
+    singularity:
+        "docker://evolbioinfo/gotree:v0.3.0b"
+    threads: 1
+    shell:
+        """
+        tree=`head {input.tree_id}`
+        date=`head {input.rd}`
+        n=$(({wildcards.i}+18))
+        tipdate='2016'
+        fixed_dates=`awk -v n="$date" -v m="$tipdate" 'BEGIN {{ y=n + 1; while (y < m) {{printf("%.2f", int(y) - n); if (y + 1 < m) {{ printf(",") }}; y += 1;}}; }}'`
+        rm -rf {output.loc}.config.tab
+        echo "tree\t$tree" > {output.loc}.config.tab
+        echo "datasets_visible\t$n" > {output.loc}.config.tab
+        echo '''format\t{wildcards.format}
+display_mode\t1
+vertical_shift_factor\t0.04
+normal_rotation\t90
+line_width\t2
+default_branch_color\trgb(170,170,170)
+line_gradient\t1
+current_font_size\t0
+internal_scale\t1
+internalScaleAxis\t0
+internalScaleGrid\t1
+internalScaleFontSize\t20
+internalScale1\t10
+internalScale2\t1
+internalScale1Color\trgb(222,222,222)
+internalScale2Color\trgb(222,222,222)
+internalScaleFixedColor\trgb(222,222,222)
+internalScale1Label\t0
+internalScale2Label\t0
+internalScaleTimeScaling\t1
+label_display\t0
+range_mode\t0
+include_ranges_legend\t0
+tree_x\t750''' >> {output.loc}.config.tab
+        echo "internalScaleRootValue\t${{date}}" >> {output.loc}.config.tab
+        echo "internalScaleFixed\t\\\"${{fixed_dates}}\\\"" >> {output.loc}.config.tab
+
+        gotree download itol -i $tree -c {output.loc}.config.tab -o {output.loc} --format {wildcards.format}
+
+        rm -rf {output.loc}.config.tab
+        """

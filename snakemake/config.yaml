@@ -1,0 +1,5 @@
+folder: "/pasteur/homes/azhukova/projects/africa"
+data_dir: 'results'
+fasta: 'sequences.fasta'
+metadata: 'Metadata.dta'
+sierra_settings: 'analysis.gql'

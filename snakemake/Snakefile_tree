@@ -1,0 +1,297 @@
+import os
+
+# To run locally:
+# snakemake --snakefile Snakefile_tree --keep-going --cores 7  --config folder=.. --use-singularity --singularity-prefix ~/.singularity --singularity-args "--home ~"
+
+# To run on bioevo:
+# change shakemake activation below if you are not Anna ;)
+# source /local/gensoft2/exe/conda/3.19.0/conda/bin/activate snakemake && module load singularity/3.5.3
+# snakemake --snakefile Snakefile_tree --keep-going --cores 1 --use-singularity --singularity-prefix $HOME/.singularity --singularity-args "-B /pasteur" --cluster "sbatch -c {threads} -o logs/{params.name}.log -e logs/{params.name}.log --mem {params.mem} -p bioevo --qos=bioevo -A bioevo -J {params.name} -C avx2" --jobs 300
+
+# To visualise the pipeline
+# snakemake --snakefile Snakefile_tree --config folder=.. --dag | dot -Tsvg > pipeline_tree.svg
+
+localrules: all
+configfile: "config.yaml"
+ruleorder: collapse_non_informative_branches > root
+
+os.makedirs('logs', exist_ok=True)
+
+folder = os.path.abspath(config["folder"])
+data_dir = os.path.join(folder, 'results')
+
+
+rule all:
+    input:
+        os.path.join(data_dir, 'aln.length'),
+        os.path.join(data_dir, 'raxmlng.lsd2.nwk'),
+        os.path.join(data_dir, 'prevalence.drms.tab')
+
+rule input_data:
+    '''
+    Renames sequences in the alignment.
+    '''
+    input:
+        fasta = os.path.join(data_dir, 'sequences.fasta'),
+        metadata = os.path.join(data_dir, 'Metadata.dta'),
+        to_remove = os.path.join(data_dir, 'mistyped_sequences.txt')
+    output:
+        fasta = temp(os.path.join(data_dir, 'ingroup.fa')),
+        metadata = os.path.join(data_dir, 'metadata.tab'),
+        dates = os.path.join(data_dir, 'lsd2.dates'),
+    params:
+        mem = 2000,
+        name = 'input_data',
+        qos = 'fast'
+    threads: 1
+    singularity: "docker://evolbioinfo/python-evol:v3.6richer.1"
+    shell:
+        """
+        python3 py/data_reader_africa.py --data_out {output.metadata} --data_in {input.metadata} \
+        --sequences_in {input.fasta} --sequences_out {output.fasta} --dates {output.dates} --to_remove {input.to_remove}
+        """
+
+rule input_aln:
+    '''
+    Renames sequences in the alignment.
+    '''
+    input:
+        fa = os.path.join(data_dir, 'ingroup.fa'),
+    output:
+        aln = os.path.join(data_dir, 'aln.ingroup.fa'),
+    params:
+        mem = 2000,
+        name = 'input_data',
+        qos = 'fast'
+    threads: 12
+    singularity: "docker://evolbioinfo/mafft:v7.313"
+    shell:
+        """
+        mafft --auto --thread {threads} {input.fa} > {output.aln}
+        """
+
+rule add_outgroup:
+    '''
+    Align outgroup against the ingroup alignment.
+    '''
+    input:
+        ref = os.path.join(data_dir, 'aln.ingroup.fa'),
+        fa = os.path.join(data_dir, 'outgroup.fa'),
+    output:
+        aln = os.path.join(data_dir, 'aln.fa')
+    params:
+        mem = 1000,
+        name = 'aln',
+        qos = 'fast'
+    threads: 12
+    singularity: "docker://evolbioinfo/mafft:v7.313"
+    shell:
+        """
+        mafft --thread {threads} --memsave --retree 1 --maxiterate 0 --add {input.fa} \
+        --keeplength {input.ref} > {output.aln}
+        """
+
+rule drm_data:
+    '''
+    Extracts information about DRMs from Stanford DB (with sierra) and reformat it into a table.
+    '''
+    input:
+        fasta = os.path.join(data_dir, 'aln.ingroup.fa'),
+    output:
+        tab = os.path.join(data_dir, 'metadata.drms.tab')
+    params:
+        mem = 2000,
+        name = 'metadata_drms',
+        qos = 'fast'
+    threads: 1
+    singularity: "docker://evolbioinfo/sdrmhunter:v0.2.1.3"
+    shell:
+        """
+        if [ -e {output.tab}.backup ]
+        then
+            cp {output.tab}.backup {output.tab}
+        else
+            sdrmhunter --fasta {input.fasta} --output {output.tab}
+            cp {output.tab} {output.tab}.backup
+        fi
+        """
+
+rule prevalence:
+    '''
+    Calculates DRM prevalence.
+    '''
+    input:
+        tab = os.path.join(data_dir, 'metadata.drms.tab')
+    output:
+        tab = os.path.join(data_dir, 'prevalence.drms.tab')
+    params:
+        mem = 2000,
+        name = 'prevalence_drms',
+        qos = 'fast'
+    threads: 1
+    singularity: "docker://evolbioinfo/python-evol:v3.6richer.1"
+    shell:
+        """
+        python3 py/prevalence.py --input {input.tab} --output {output.tab} --subtype C
+        """
+
+
+rule aln_length:
+    '''
+    Calculates alignment length.
+    '''
+    input:
+        aln = os.path.join(data_dir, '{aln}.fa'),
+    output:
+        length = os.path.join(data_dir, '{aln}.length'),
+    singularity:
+        "docker://evolbioinfo/goalign:v0.3.2"
+    params:
+        mem = 60000,
+        name = 'aln_len',
+        qos = 'fast'
+    threads: 1
+    shell:
+        """
+        goalign stats length -i {input.aln} > {output.length}
+        """
+
+rule raxmlng:
+    '''
+    Reconstructs a tree with RAxML-NG.
+    '''
+    input:
+        aln = os.path.join(data_dir, 'aln.fa'),
+        aln_length = os.path.join(data_dir, 'aln.length'),
+    output:
+        tree = os.path.join(data_dir, 'raxmlng.nwk'),
+        log = os.path.join(data_dir, 'raxmlng.log'),
+        model = os.path.join(data_dir, 'raxmlng.model'),
+    threads: 28
+    singularity: "docker://evolbioinfo/raxml-ng:v0.9.0"
+    params:
+        mem = 60000,
+        name = 'raxmlng',
+    shell:
+        """
+        n=`head {input.aln_length}`
+        n=`awk -v n="$n" 'BEGIN {{ m=1/n/10; print m}}'`
+
+        raxml-ng --model GTR+G4+FO+IO --msa {input.aln} --msa-format FASTA --data-type DNA \
+        --seed 239 --threads {threads} --force --blmin $n --precision 16 --tree pars{{1}} --simd avx2
+
+        mv {input.aln}.raxml.bestTree {output.tree}
+        mv {input.aln}.raxml.log {output.log}
+        mv {input.aln}.raxml.bestModel {output.model}
+
+        rm -rf {input.aln}.raxml*
+        """
+
+rule collapse_non_informative_branches:
+    '''
+    Collapse internal branches of length <= 1/2 mut, set external branches of length <= 1/2 mut/site to zero.
+    If the tree is rooted and a root child branch is to be collapsed, set it to zero instead (to keep the tree rooted).
+    '''
+    input:
+        tree = os.path.join(data_dir, '{tree}.nwk'),
+        length = os.path.join(data_dir, 'aln.length'),
+    output:
+        tree = os.path.join(data_dir, '{tree}.collapsed.nwk'),
+    params:
+        mem = 2000,
+        name = 'collapse',
+        qos = 'fast'
+    threads: 1
+    singularity: "docker://evolbioinfo/python-evol:v3.6richer"
+    shell:
+        """
+        n=`head {input.length}`
+        l=`awk -v n="$n" 'BEGIN {{ m=1/n/2; print m}}'`
+
+        python3 py/collapse.py --input_tree {input.tree} --output_tree {output.tree} --threshold $l --feature dist
+        """
+
+rule root:
+    '''
+    Roots a tree with an outgroup.
+    '''
+    input:
+        tree = os.path.join(data_dir, '{tree}.nwk'),
+        outgroup = os.path.join(data_dir, 'outgroup.txt'),
+    output:
+        tree = os.path.join(data_dir, 'rooted_{tree}.nwk'),
+    singularity:
+        "docker://evolbioinfo/gotree:v0.3.0b"
+    params:
+        mem = 2000,
+        name = 'root',
+        qos = 'fast'
+    threads: 1
+    shell:
+        """
+        gotree support clear -i {input.tree} | gotree reroot outgroup -l {input.outgroup} -o {output.tree} -r
+        """
+
+
+rule date:
+    '''
+    Dates a tree.
+    '''
+    input:
+        tree = os.path.join(data_dir, 'rooted_{tree}.collapsed.nwk'),
+        dates = os.path.join(data_dir, 'lsd2.dates'),
+        length = os.path.join(data_dir, 'aln.length')
+    output:
+        tree = os.path.join(data_dir, '{tree}.lsd2.nexus'),
+        log = os.path.join(data_dir, '{tree}.lsd2.log'),
+        rd = os.path.join(data_dir, '{tree}.lsd2.rootdate'),
+        outliers = os.path.join(data_dir, '{tree}.lsd2.outliers'),
+    threads: 1
+    singularity: "docker://evolbioinfo/lsd2:v1.6.5"
+    params:
+        mem = 4000,
+        name = 'lsd2',
+        wd = os.path.join(data_dir, '{tree}.wd_lsd2')
+    shell:
+        """
+        n=`head {input.length}`
+
+        echo "lsd2 -i {input.tree} -d {input.dates} -c -s $n -o {params.wd} -f 1000 -e 3"
+
+        lsd2 -i {input.tree} -d {input.dates} -c -s $n -o {params.wd} -f 1000 -e 3
+
+        pattern_g='\\- The input dates associated with the following'
+        pattern_s='\\- The input dates associated with the following [0-9]* nodes are considered as outliers, so the nodes were removed from the analysis:  '
+
+        outliers=`grep -i "$pattern_g" {params.wd} | sed -e "s/$pattern_s//g"`
+        for o in $outliers
+        do
+            echo $o >> {output.outliers}
+        done
+
+        mv "{params.wd}.date.nexus" "{output.tree}"
+        mv "{params.wd}" "{output.log}"
+        rm -rf {params.wd}*
+
+        echo `grep "], tMRCA" {output.log} | sed -e 's/rate [0-9\\.e+-]\\+ \\[[0-9\\.e+-]\\+; [0-9\\.e+-]\\+\\], tMRCA //g' \
+        | sed -e 's/ \\[[0-9\\.e+-]\\+; [0-9\\.e+-]\\+\\], objective function [0-9\\.e+-]\\+//g'` > {output.rd}
+        """
+
+rule nex2nwk:
+    '''
+    Converts a nexus tree to newick.
+    '''
+    input:
+        tree = os.path.join(data_dir, '{tree}.nexus'),
+    output:
+        tree = os.path.join(data_dir, '{tree}.nwk'),
+    singularity: "docker://evolbioinfo/gotree:v0.4.1a"
+    params:
+        mem = 2000,
+        name = 'nex2nwk',
+    threads: 1
+    shell:
+        """
+        gotree reformat newick -i {input.tree} -f nexus -o {output.tree}
+        sed -i -e 's/\\[[^]]*\\]//g' {output.tree}
+        """
